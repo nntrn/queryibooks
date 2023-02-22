@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Author: Annie Tran https://github.com/nntrn
+# Repository: https://github.com/nntrn/queryibooks
+
+set -e
+
+PROG=$(basename $0)
+VERSION=1.0
+SCRIPT=$(realpath $0)
+DIR=$(dirname $SCRIPT)
+NOW=$(date +%s)
+PROG_HOME=$HOME/.queryibooks
+CACHEDIR=$PROG_HOME/.cache/$(date +%F)
+LOGFILE=$PROG_HOME/.cache/logs.txt
+
+QUERYIBOOKS_HTML_TEMPLATE=$DIR/templates/index.html
+QUERYIBOOKS_TIME=3600
+QUERYIBOOKS_DEBUGGER_ON=
+QUERYIBOOKS_FORCE=
+QUERYIBOOKS_PRINT=
+QUERYIBOOKS_OUT=$CACHEDIR
+
+DB_BASE=$HOME/Library/Containers/com.apple.iBooksX
+DB_ANNOTATIONS=$(ls -1 $DB_BASE/Data/Documents/AEAnnotation/*.sqlite)
+SQL_ANNOTATIONS='select * from ZAEANNOTATION where ZANNOTATIONSELECTEDTEXT IS NOT NULL;'
+DB_ASSETS=$(ls -1 $DB_BASE/Data/Documents/BKLibrary/*.sqlite)
+SQL_ASSETS='select * from ZBKLIBRARYASSET order by ZPURCHASEDATE desc;'
+
+_echo() {
+  [[ ! -d $PROG_HOME ]] && mkdir -p $PROG_HOME
+  if [[ -n $QUERYIBOOKS_DEBUGGER_ON ]]; then
+    echo "$(date +'[%c]') $*" | tee -a $LOGFILE
+  else
+    echo "$(date +'[%c]') $*" >>$LOGFILE
+  fi
+}
+
+wal_checkpoint() {
+  DB="$1"
+  if [[ -f $DB-wal ]]; then
+    MOD_DB=$(stat -f %m $DB)
+    MOD_WALDB=$(stat -f %m $DB-wal)
+    if [[ $MOD_DB -lt $MOD_WALDB ]]; then
+      _echo "Updating database: $DB"
+      sqlite3 $DB 'pragma wal_checkpoint;' >/dev/null
+    fi
+  fi
+}
+
+get_var() {
+  echo "${!1}"
+}
+
+query_db() {
+  TABLE=$1
+  OUTFILE=$QUERYIBOOKS_OUT/${TABLE,,}.json
+  TIMEDIFF=0
+  DB=$(get_var DB_${TABLE})
+  SQL="$(get_var SQL_${TABLE})"
+
+  mkdir -p $CACHEDIR
+
+  if [[ -f $OUTFILE ]]; then
+    LAST_MOD=$(stat -f %m $OUTFILE)
+    TIMEDIFF=$((NOW - LAST_MOD))
+  fi
+
+  [[ $TIMEDIFF -gt $QUERYIBOOKS_TIME ]] && QUERYIBOOKS_FORCE=1
+
+  if [[ ! -f $OUTFILE ]] || [[ -n $QUERYIBOOKS_FORCE ]]; then
+    wal_checkpoint "$DB"
+    _echo "Saving $OUTFILE"
+    sqlite3 -json "$DB" "$SQL" ".exit" >$OUTFILE
+  else
+    _echo "Using $OUTFILE (Created ${TIMEDIFF}s ago)"
+  fi
+}
+
+create_annotations_html() {
+  if [[ -f $1 ]] && [[ -f $QUERYIBOOKS_HTML_TEMPLATE ]]; then
+    cat $QUERYIBOOKS_HTML_TEMPLATE | sed '/^.*<script id="annotations"/q'
+    cat $1 | jq -c | sed 's|},{|},\n  {|g'
+    cat $QUERYIBOOKS_HTML_TEMPLATE | sed -n '/<!--/,/<\/script/p'
+  else
+    return 1
+  fi
+}
+
+main() {
+  mkdir -p $QUERYIBOOKS_OUT
+  query_db ANNOTATIONS
+  query_db ASSETS
+
+  jq -n -L $DIR/.jq 'include "queryibooks"; ibooks_data' $CACHEDIR/{assets,annotations}.json >$QUERYIBOOKS_OUT/data.json
+  create_annotations_html $QUERYIBOOKS_OUT/data.json >$QUERYIBOOKS_OUT/annotations.html
+}
+
+_version() {
+  echo "$PROG-$VERSION"
+  exit 0
+}
+
+_usage() {
+  echo "
+Tool for extracting asset and annotation data from ibooks
+
+Usage:
+  $PROG [OPTIONS]
+
+Options:
+  -h, --help
+  -v, --version
+  -f, --force                 [QUERYIBOOKS_FORCE]
+  -o, --out <DIR>             [QUERYIBOOKS_OUT]
+  -r, --recheck <SECS>        [QUERYIBOOKS_TIME] (Default: 3600)
+  -p, --print <FILENAME>      [QUERYIBOOKS_PRINT]
+  --html-template <FILEPATH>  [QUERYIBOOKS_HTML_TEMPLATE]
+"
+  exit 1
+}
+
+for i in "$@"; do
+  case $i in
+  -h | --help) _usage ;;
+  -v | --version) _version ;;
+  -p | --print) QUERYIBOOKS_PRINT=$2 && shift 2 ;;
+  -f | --force) QUERYIBOOKS_FORCE=1 && shift ;;
+  -o | --out) QUERYIBOOKS_OUT=$2 && shift 2 ;;
+  -r | --recheck) QUERYIBOOKS_TIME=$2 && shift 2 ;;
+  --html-template) QUERYIBOOKS_HTML_TEMPLATE="$2" && shift 2 ;;
+  esac
+done
+
+main "$@" 1>/dev/null
+
+if [[ -n $QUERYIBOOKS_PRINT ]]; then
+  _PRINTFILE=$(ls -1 $QUERYIBOOKS_OUT/${QUERYIBOOKS_PRINT}*)
+  if [[ -f $_PRINTFILE ]]; then
+    cat $_PRINTFILE
+  else
+    echo "Error $_PRINTFILE"
+  fi
+else
+  find $QUERYIBOOKS_OUT -type f -name "*.json" -exec realpath {} \;
+fi
