@@ -91,7 +91,7 @@ main() {
   query_db ANNOTATIONS
   query_db ASSETS
 
-  jq -n -L $DIR/.jq 'include "queryibooks"; ibooks_data' $CACHEDIR/{assets,annotations}.json >$QUERYIBOOKS_OUT/data.json
+  jq -n -L $DIR/.jq 'include "queryibooks"; ibooks_data' $QUERYIBOOKS_OUT/{assets,annotations}.json >$QUERYIBOOKS_OUT/data.json
   create_annotations_html $QUERYIBOOKS_OUT/data.json >$QUERYIBOOKS_OUT/annotations.html
 }
 
