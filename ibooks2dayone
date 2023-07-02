@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Author: https://github.com/nntrn
+# Repository: https://github.com/nntrn/queryibooks
+
+set -e
+
+if ! command -v jq &>/dev/null; then
+  echo "Download jq before continuing.. Aborting"
+  exit 1
+fi
+
+DOWNLOAD_DIR=$HOME/Downloads
+DATE="$(date '+%F-%H-%M')"
+TMPDIR=$(mktemp -d)
+IBOOKS_DATA=$(realpath $1)
+ZIPFILENAME=${DATE}-ibooks.zip
+
+JQ_FUNC='def h2:
+  if ((.|type) == "string" and (.|gsub(" "; "")? // ""|length) > 0)
+  then "\n\n---\n\n## \(. | gsub("…";"."))\n"
+  else "\n---\n"
+  end;
+
+def wrap_text($s):
+  $s |  "* " + gsub("(?<a>[\\s\\S]{70,85}) "; .a + "\n  ";"m" );
+
+map(select((.ZTITLE) and (.ZANNOTATIONSELECTEDTEXT|length) >10 ))
+| sort_by(.ZANNOTATIONCREATIONDATE)
+| sort_by((.ZPLLOCATIONRANGESTART|tonumber))
+| group_by(.ZSORTTITLE)
+| map(select(length>1))
+| map({
+    title: .[0].ZTITLE,
+    author: .[0].ZAUTHOR,
+    uuid: (.[0].ZASSETGUID|gsub("-";"")? // ""),
+    creationDate: min_by(.ZANNOTATIONCREATIONDATE).ZANNOTATIONCREATIONDATE,
+    modifiedDate: max_by(.ZANNOTATIONCREATIONDATE).ZANNOTATIONCREATIONDATE,
+    isAllDay: false,
+    isPinned: false,
+    starred: false,
+    timeZone: "America/Chicago",
+    tags: (.[0].ZGENRE|ascii_downcase|split(" & ")|map(gsub(" ";"-"))),
+    text: (
+      group_by(.ZPLLOCATIONRANGESTART)
+      | map(
+        [
+          (.[0].ZFUTUREPROOFING5| h2)?,
+          map(("* \(.ZANNOTATIONSELECTEDTEXT)"| split("\n") | map(select((gsub("[\r\n\t]"; "")? |length) > 3 )))
+            | join(" ") | gsub("[\t\r]";" ") | gsub("[ ]{1,}";" ") )
+        ] | flatten | join("\n\n"))
+      | flatten | join("\n")
+    )
+  })
+| (map (. + {text: (
+    "# \(.title)\n\nby \(.author)\n\n\(.text)\n"
+    | gsub("[\\n]{2,}";"\n\n")
+    | gsub("(?<a>[^ \n])[0-9]+\n"; "\(.a)\n"; "m"))
+  }))
+| sort_by(.modifiedDate)
+| {metadata:{version: "1.0"}, entries: map(del(.title,.author) )}'
+
+jq "$JQ_FUNC" $IBOOKS_DATA >$TMPDIR/ibooks.json
+
+cd $TMPDIR
+
+zip -r ../$ZIPFILENAME .
+
+cp ../$ZIPFILENAME $DOWNLOAD_DIR/
+
+echo "Import to Dayone: ~/Downloads/$ZIPFILENAME"
