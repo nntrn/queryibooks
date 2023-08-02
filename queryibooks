@@ -6,16 +6,18 @@
 set -e
 
 PROG=queryibooks
-VERSION=2.0
+VERSION=2.1
+TODAY="$(date +%F-%H)"
 
-USER_IBOOKS=$HOME/Library/Containers/com.apple.iBooksX
+IBOOKS_LIBRARY=$HOME/Library/Containers/com.apple.iBooksX
 QUERYIBOOKS_HOME="$HOME/.cache/queryibooks"
+QUERYIBOOKS_CACHE="$QUERYIBOOKS_HOME/$TODAY"
 
-mkdir -p $QUERYIBOOKS_HOME
+mkdir -p $QUERYIBOOKS_CACHE
 
 declare -A db_annotations
 db_annotations[name]=annotations
-db_annotations[path]="$(ls -1 $USER_IBOOKS/Data/Documents/AEAnnotation/*.sqlite)"
+db_annotations[path]="$(ls -1 $IBOOKS_LIBRARY/Data/Documents/AEAnnotation/*.sqlite)"
 db_annotations[sql]="select * from ZAEANNOTATION
 where ZANNOTATIONSELECTEDTEXT IS NOT NULL
 and ZANNOTATIONSELECTEDTEXT <> ''
@@ -23,29 +25,25 @@ and ZANNOTATIONDELETED = 0;"
 
 declare -A db_assets
 db_assets[name]=assets
-db_assets[path]="$(ls -1 $USER_IBOOKS/Data/Documents/BKLibrary/*.sqlite)"
+db_assets[path]="$(ls -1 $IBOOKS_LIBRARY/Data/Documents/BKLibrary/*.sqlite)"
 db_assets[sql]="select * from ZBKLIBRARYASSET;"
 
 HELP_TEXT='
-Tool for extracting iBooks annotations
+queryibooks - Tool for extracting iBooks annotations
 
-Usage:
-  queryibooks [-f|--force] [-w|--write-to] [-c|--max-cache-age]
+USAGE:
+  queryibooks [-f|--no-cache] [-w|--write-to]
   queryibooks [-h|--help] [-v|--version]
 
-Options:
-  -f, --force             Run database update regardless of cache age
+OPTIONS:
+  -f, --no-cache          Run database update regardless of data changes
   -w, --write-to          Where to write output to
-  -c, --use-cache         Use data from last run
-  -c, --max-cache-age
   -h, --help
   -v, --version
 
-Environment:
-  QUERYIBOOKS_FORCE=1           # same as --force
-  QUERYIBOOKS_USECACHE=1        # same as --use-cache
-  QUERYIBOOKS_OUTPUT=<FILEPATH>
-  QUERYIBOOKS_MAX_CACHE=<minutes>
+ENVIRONMENT:
+  export QUERYIBOOKS_NO_CACHE=<BooleanInt>
+  export QUERYIBOOKS_OUTPUT=<FILEPATH>
 '
 
 JQ_FUNC='
@@ -53,17 +51,27 @@ JQ_FUNC='
     Z_PK,
     ZANNOTATIONCREATIONDATE,
     ZANNOTATIONASSETID,
-    ZANNOTATIONSELECTEDTEXT,
     ZFUTUREPROOFING5,
     ZANNOTATIONNOTE,
-    ZPLLOCATIONRANGESTART,
     ZANNOTATIONSTYLE,
     ZANNOTATIONTYPE,
-    ZANNOTATIONISUNDERLINE
+    ZANNOTATIONISUNDERLINE,
+    ZPLLOCATIONRANGESTART,
+    ZANNOTATIONLOCATION,
+    ZANNOTATIONSELECTEDTEXT,
+    ZANNOTATIONREPRESENTATIVETEXT
   };
 
-  def map_assets:
-    { ZASSETID, ZTITLE, ZAUTHOR, ZGENRE, ZSTOREID, ZSORTTITLE, ZASSETGUID };
+  def map_assets: {
+    ZASSETID,
+    ZTITLE,
+    ZAUTHOR,
+    ZGENRE,
+    ZSTOREID,
+    ZSORTAUTHOR,
+    ZSORTTITLE,
+    ZASSETGUID
+  };
 
   def map_json:
     reduce inputs as $s (.; .[input_filename|gsub(".json";"")|split("/")|last|ascii_downcase] += $s);
@@ -77,12 +85,12 @@ JQ_FUNC='
 
   def convertmacostime:
     map(
-      with_entries(
-        .key as $k|.value |= (
+      with_entries( .key as $k|.value |= (
         if ($k|contains("DATE"))
         then ((.// 0) +978307200|strflocaltime("%FT%TZ"))
         else .
-        end)
+        end
+        )
       )
     );
 
@@ -99,42 +107,37 @@ _version() {
   exit 0
 }
 
-log() {
-  echo -e "$(date +'%F %X') $*" >>${QUERYIBOOKS_HOME}/log.txt
+_log() {
+  echo -e "\e[0;49;36m$* \e[0m" 3>&2 2>&1 >&3 3>&-
 }
 
 sync_database() {
   local DB="$1"
   if [[ -f $DB-wal ]]; then
-    MOD_DB=$(stat -f %m "$DB")
-    MOD_WALDB=$(stat -f %m "$DB-wal")
+    MOD_DB=$(date -r "$DB" +%s)
+    MOD_WALDB=$(date -r "${DB}-wal" +%s)
     if [[ $MOD_DB -lt $MOD_WALDB ]]; then
+      _log "Syncing ${DB##*/} (Last sync: $(date -r $DB +'%F %X'))"
       sqlite3 "$DB" 'pragma wal_checkpoint;' ".exit" >/dev/null
-      log "Sync ${DB##*/} $MOD_DB -> $(stat -f %m "$DB")"
-      echo 1
+      return $?
     fi
   fi
 }
 
 querydata() {
   local -n data=$1
-
   TABLE="${data[name]}"
   DB_PATH="${data[path]}"
   SQL="${data[sql]}"
   SAVEFILE="${QUERYIBOOKS_CACHE}/${TABLE}.json"
 
-  if [[ $QUERYIBOOKS_USECACHE -eq 1 ]]; then
-    QUERYIBOOKS_FORCE=
-  else
-    QUERYIBOOKS_FORCE=$(sync_database "$DB_PATH")
-  fi
+  sync_database "$DB_PATH"
 
-  [[ ! -f $SAVEFILE ]] && QUERYIBOOKS_FORCE=1
-
-  if [[ $QUERYIBOOKS_FORCE -eq 1 ]]; then
+  if [[ ! -f $SAVEFILE ]] || [[ $QUERYIBOOKS_NO_CACHE -eq 1 ]]; then
+    _log "Saving $TABLE to $SAVEFILE"
     sqlite3 -json "$DB_PATH" "$SQL" ".exit" >$SAVEFILE
-    log "Fetch updated data from ${DB_PATH##*/}"
+  else
+    _log "Reading $TABLE from $SAVEFILE"
   fi
 }
 
@@ -142,27 +145,14 @@ for i in "$@"; do
   case $i in
   -h | --help) _usage ;;
   -v | --version) _version ;;
-  -f | --force) QUERYIBOOKS_FORCE=1 && shift ;;
+  -f | --no-cache) QUERYIBOOKS_NO_CACHE=1 && shift ;;
   -w | --write-to) QUERYIBOOKS_OUTPUT=$2 && shift 2 ;;
-  -c | --use-cache) QUERYIBOOKS_USECACHE=1 && shift ;;
   esac
 done
 
 if ! command -v jq &>/dev/null; then
   echo "Download jq before continuing.. Aborting"
   exit 1
-fi
-
-QUERYIBOOKS_ENV=$QUERYIBOOKS_HOME/.env
-QUERYIBOOKS_CACHE="$QUERYIBOOKS_HOME"
-
-if [[ $QUERYIBOOKS_USECACHE -eq 1 ]] && [[ -f $QUERYIBOOKS_ENV ]]; then
-  source $QUERYIBOOKS_ENV
-  log "QUERYIBOOKS_ENV=$QUERYIBOOKS_ENV"
-else
-  TODAY="$(date +%F-%H)"
-  QUERYIBOOKS_CACHE="$QUERYIBOOKS_HOME/$TODAY"
-  mkdir -p $QUERYIBOOKS_CACHE
 fi
 
 querydata db_assets
@@ -172,9 +162,7 @@ jq -n "$JQ_FUNC build" ${QUERYIBOOKS_CACHE}/{assets,annotations}.json >$QUERYIBO
 
 if [[ -n $QUERYIBOOKS_OUTPUT ]]; then
   cp "$QUERYIBOOKS_CACHE/ibooks.json" "$QUERYIBOOKS_OUTPUT"
-  echo "Saved to $QUERYIBOOKS_OUTPUT"
+  _log "Saved to $QUERYIBOOKS_OUTPUT"
 else
   cat $QUERYIBOOKS_CACHE/ibooks.json
 fi
-
-echo "QUERYIBOOKS_CACHE=$QUERYIBOOKS_CACHE" >$QUERYIBOOKS_ENV
