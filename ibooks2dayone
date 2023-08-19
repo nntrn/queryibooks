@@ -19,13 +19,12 @@ JQ_FUNC='
     end;
 
   def remove_citations:
-    gsub("[\\n]{2,}";"\n\n")
-    | gsub("(?<a>[^ \n])[0-9]+\n"; "\(.a)\n"; "m");
+    gsub("[\\n]{2,}";"\n\n") | gsub("(?<a>[^ \n])[0-9]+\n"; "\(.a)\n"; "m");
 
   def create_dayone_import:
-    map(select((.ZTITLE) and (.ZANNOTATIONSELECTEDTEXT|length) >10 ))
-    | sort_by(.ZANNOTATIONCREATIONDATE)
-    | sort_by((.ZPLLOCATIONRANGESTART|tonumber))
+    map(. + (.ZANNOTATIONLOCATION|capture("\\[(?<chapter>[^\\]]+)\\].*/(?<location>.*)\\)" )))
+    | map(select((.ZTITLE) and (.ZANNOTATIONSELECTEDTEXT|length) >10 ))
+    | sort_by(.ZANNOTATIONLOCATION)
     | group_by(.ZSORTTITLE)
     | map(select(length>1))
     | map({
@@ -40,7 +39,7 @@ JQ_FUNC='
         timeZone: "America/Chicago",
         tags: (.[0].ZGENRE|ascii_downcase|split(" & ")|map(gsub(" ";"-"))),
         text: (
-          group_by(.ZPLLOCATIONRANGESTART)
+          group_by(.chapter)
           | map(
             [
               (.[0].ZFUTUREPROOFING5| h2)?,
@@ -50,7 +49,7 @@ JQ_FUNC='
           | flatten | join("\n")
         )
       })
-    | map (. + {text: ( "# \(.title)\n\nby \(.author)\n\n\(.text| remove_citations)\n") })
+    | map (. + {text: ( "# \(.title)\n\nby \(.author)\n\(.text| remove_citations |gsub("[\\n]{2,}";"\n\n") )\n") })
     | sort_by(.modifiedDate)
     | { metadata: {version: "1.0"}, entries: map(del(.title,.author)) };
 '
