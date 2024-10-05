@@ -6,13 +6,18 @@
 set -e
 
 PROG=queryibooks
-VERSION=2.1.1
-TODAY="$(date +%F-%H)"
+VERSION=2.1.2
+TODAY="$(date +%F)"
+SCRIPT=$(realpath $0)
+DIR=${SCRIPT%/*}
 
 USER_IBOOKS=$HOME/Library/Containers/com.apple.iBooksX
-QUERYIBOOKS_HOME="$HOME/.cache/queryibooks"
-QUERYIBOOKS_ENV=$QUERYIBOOKS_HOME/.env
-QUERYIBOOKS_CACHE="$QUERYIBOOKS_HOME/$TODAY"
+QUERYIBOOKS_CACHE="$HOME/.cache/queryibooks"
+QUERYIBOOKS_LOGFILE=$QUERYIBOOKS_CACHE/log.txt
+QUERYIBOOKS_ENV=$QUERYIBOOKS_CACHE/.env
+QUERYIBOOKS_CACHE="$QUERYIBOOKS_CACHE/$TODAY"
+QUERYIBOOKS_CHECKPOINT=
+QUERYIBOOKS_USECACHE=0
 
 mkdir -p $QUERYIBOOKS_CACHE
 
@@ -51,48 +56,6 @@ Environment:
   QUERYIBOOKS_MAX_CACHE=<minutes>
 '
 
-JQ_FUNC='
-  def nsdate2unix($ts; $fmt): ($ts // 0 | tonumber) + 978307200 | strflocaltime($fmt);
-  def nsdate2unix($ts):  nsdate2unix($ts; "%FT%TZ");
-  def nsdate2unix: nsdate2unix(.; "%FT%TZ");
-
-  def map_annotations: {
-    Z_PK,
-    ZANNOTATIONCREATIONDATE: nsdate2unix(.ZANNOTATIONCREATIONDATE),
-    ZANNOTATIONASSETID,
-    ZFUTUREPROOFING5,
-    ZANNOTATIONNOTE,
-    ZANNOTATIONSTYLE,
-    ZANNOTATIONTYPE,
-    ZANNOTATIONISUNDERLINE,
-    ZPLLOCATIONRANGESTART,
-    ZANNOTATIONLOCATION,
-    ZANNOTATIONSELECTEDTEXT
-  };
-
-  def map_assets: {
-    ZASSETID,
-    ZTITLE,
-    ZAUTHOR,
-    ZGENRE,
-    ZSORTAUTHOR,
-    ZSORTTITLE,
-    ZASSETGUID
-  };
-
-  def map_json:
-    reduce inputs as $s (.; .[input_filename|gsub(".json";"")|split("/")|last|ascii_downcase] += $s);
-
-  def join_assets:
-    INDEX(
-      .assets[]; .ZASSETID) as $c
-      | .annotations
-      | map((map_annotations)+($c[.ZANNOTATIONASSETID]|map_assets)
-    );
-
-  def build: map_json|join_assets|sort_by(.Z_PK);
-'
-
 _usage() {
   echo "$HELP_TEXT"
   exit 1
@@ -103,53 +66,56 @@ _version() {
   exit 0
 }
 
-log() {
-  echo -e "$(date +'%F %X') $*" >>${QUERYIBOOKS_HOME}/log.txt
+_log() {
+  if [[ QUERYIBOOKS_VERBOSE -eq 1 ]]; then
+    echo -e "\033[0;${2:-33}m$1\033[0m" 3>&2 2>&1 >&3 3>&-
+  fi
+  echo -e "$(date +'%F %X') $1" >>$QUERYIBOOKS_LOGFILE
 }
 
 sync_database() {
   local DB="$1"
+  QUERYIBOOKS_CHECKPOINT=
   if [[ -f $DB-wal ]]; then
-    MOD_DB=$(stat -f %m "$DB")
-    MOD_WALDB=$(stat -f %m "$DB-wal")
-    if [[ $MOD_DB -lt $MOD_WALDB ]]; then
-      sqlite3 "$DB" 'pragma wal_checkpoint;' ".exit" >/dev/null
-      log "Sync ${DB##*/} $MOD_DB -> $(stat -f %m "$DB")"
-      echo 1
+    DB_LASTMOD=$(stat -f %m "$DB")
+    WAL_LASTMOD=$(stat -f %m "$DB-wal")
+    if [[ $DB_LASTMOD -lt $WAL_LASTMOD ]]; then
+      _log "Running checkpoint on ${DB##*/}"
+      sqlite3 $DB 'pragma wal_checkpoint;' >/dev/null
+      QUERYIBOOKS_CHECKPOINT=1
     fi
   fi
 }
 
 querydata() {
   local -n data=$1
+  local FORCE=${QUERYIBOOKS_FORCE}
+  local TABLE="${data[name]}"
+  local DB_PATH="${data[path]}"
+  local SQL="${data[sql]}"
+  local SAVEFILE="${QUERYIBOOKS_CACHE}/${TABLE}.json"
 
-  TABLE="${data[name]}"
-  DB_PATH="${data[path]}"
-  SQL="${data[sql]}"
-  SAVEFILE="${QUERYIBOOKS_CACHE}/${TABLE}.json"
+  [[ $QUERYIBOOKS_USECACHE -ne 1 ]] && sync_database "$DB_PATH"
 
-  if [[ $QUERYIBOOKS_USECACHE -eq 1 ]]; then
-    QUERYIBOOKS_FORCE=
-  else
-    QUERYIBOOKS_FORCE=$(sync_database "$DB_PATH")
-  fi
-
-  [[ ! -f $SAVEFILE ]] && QUERYIBOOKS_FORCE=1
-
-  if [[ $QUERYIBOOKS_FORCE -eq 1 ]]; then
+  if [[ $QUERYIBOOKS_CHECKPOINT -eq 1 || ! -f $SAVEFILE || $QUERYIBOOKS_FORCE -eq 1 ]]; then
+    _log "Running sqlite3 for ${DB_PATH##*/}"
     sqlite3 -json "$DB_PATH" "$SQL" ".exit" >$SAVEFILE
-    log "Fetch updated data from ${DB_PATH##*/}"
+    _log "Saved to $SAVEFILE"
+  else
+    _log "Skip run for ${DB_PATH##*/}"
   fi
 }
 
-for i in "$@"; do
-  case $i in
+while true; do
+  case $1 in
   -h | --help) _usage ;;
   -v | --version) _version ;;
-  -f | --force) QUERYIBOOKS_FORCE=1 && shift ;;
-  -w | --write-to) QUERYIBOOKS_OUTPUT=$2 && shift 2 ;;
-  -c | --use-cache) QUERYIBOOKS_USECACHE=1 && shift ;;
+  -f | --force) QUERYIBOOKS_FORCE=1 ;;
+  -o | --write-to) QUERYIBOOKS_OUTPUT=$2 && shift ;;
+  -c | --use-cache) QUERYIBOOKS_USECACHE=1 ;;
+  --verbose) QUERYIBOOKS_VERBOSE=1 ;;
   esac
+  shift || break
 done
 
 if ! command -v jq &>/dev/null; then
@@ -160,7 +126,8 @@ fi
 querydata db_assets
 querydata db_annotations
 
-jq -n "$JQ_FUNC build" ${QUERYIBOOKS_CACHE}/{assets,annotations}.json >$QUERYIBOOKS_CACHE/ibooks.json
+jq --slurpfile assets $QUERYIBOOKS_CACHE/assets.json -L $DIR \
+  'include "queryibooks"; create_annnotations' $QUERYIBOOKS_CACHE/annotations.json >$QUERYIBOOKS_CACHE/ibooks.json
 
 if [[ -n $QUERYIBOOKS_OUTPUT ]]; then
   cp "$QUERYIBOOKS_CACHE/ibooks.json" "$QUERYIBOOKS_OUTPUT"
@@ -168,3 +135,5 @@ if [[ -n $QUERYIBOOKS_OUTPUT ]]; then
 else
   cat $QUERYIBOOKS_CACHE/ibooks.json
 fi
+
+# '($books[] | map(. + {cdate: (.created|strptime("%Y-%m-%dT%H:%M:%SZ")|mktime|strftime("%Y-%m-%d"))}) |INDEX(.[];.assetid)) as $asset'
